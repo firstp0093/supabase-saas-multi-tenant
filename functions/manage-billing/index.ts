@@ -40,7 +40,7 @@ serve(async (req) => {
     if (!authError && authUser) {
       user = authUser
       const { data: m } = await supabase
-        .from('tenant_users')
+        .from('user_tenants')
         .select('tenant_id, tenants(id, stripe_customer_id, stripe_subscription_id, plan)')
         .eq('user_id', user.id)
         .single()
