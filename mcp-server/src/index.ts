@@ -11,14 +11,114 @@ import {
 // Configuration from environment
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const ADMIN_KEY = process.env.ADMIN_KEY!;
 const USER_TOKEN = process.env.SUPABASE_USER_TOKEN; // Optional: for user-scoped operations
+const SITE_URL = process.env.SITE_URL || "http://localhost:3000";
 
 // =====================================================
 // TOOL DEFINITIONS
 // =====================================================
 
 const tools: Tool[] = [
+  // ===== AUTHENTICATION =====
+  {
+    name: "auth_sign_up",
+    description: "Create a new user account",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "User email address" },
+        password: { type: "string", description: "User password (min 6 chars)" },
+        metadata: { type: "object", description: "Optional user metadata (name, etc.)" }
+      },
+      required: ["email", "password"]
+    }
+  },
+  {
+    name: "auth_sign_in",
+    description: "Sign in and get session tokens",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "User email address" },
+        password: { type: "string", description: "User password" }
+      },
+      required: ["email", "password"]
+    }
+  },
+  {
+    name: "auth_sign_out",
+    description: "Sign out and invalidate session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        access_token: { type: "string", description: "Current access token to invalidate" }
+      },
+      required: ["access_token"]
+    }
+  },
+  {
+    name: "auth_get_user",
+    description: "Get current user details from access token",
+    inputSchema: {
+      type: "object",
+      properties: {
+        access_token: { type: "string", description: "User's access token" }
+      },
+      required: ["access_token"]
+    }
+  },
+  {
+    name: "auth_refresh_token",
+    description: "Refresh an expired access token",
+    inputSchema: {
+      type: "object",
+      properties: {
+        refresh_token: { type: "string", description: "Refresh token from sign-in" }
+      },
+      required: ["refresh_token"]
+    }
+  },
+  {
+    name: "auth_reset_password",
+    description: "Send password reset email",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "Email address to send reset link" }
+      },
+      required: ["email"]
+    }
+  },
+  {
+    name: "auth_update_password",
+    description: "Update user password (requires valid session)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        access_token: { type: "string", description: "User's access token" },
+        new_password: { type: "string", description: "New password (min 6 chars)" }
+      },
+      required: ["access_token", "new_password"]
+    }
+  },
+  {
+    name: "auth_sign_up_with_tenant",
+    description: "Create user account AND provision tenant in one call (complete onboarding)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "User email address" },
+        password: { type: "string", description: "User password (min 6 chars)" },
+        tenant_name: { type: "string", description: "Organization/company name" },
+        tenant_slug: { type: "string", description: "URL-friendly slug (optional, auto-generated from name)" },
+        user_metadata: { type: "object", description: "Optional user metadata" }
+      },
+      required: ["email", "password", "tenant_name"]
+    }
+  },
+
   // ===== TENANT & TEAM =====
   {
     name: "provision_tenant",
@@ -363,6 +463,306 @@ const tools: Tool[] = [
 ];
 
 // =====================================================
+// AUTH HANDLERS (Direct Supabase Auth API calls)
+// =====================================================
+
+async function handleAuthSignUp(args: Record<string, unknown>): Promise<unknown> {
+  const { email, password, metadata } = args as { 
+    email: string; 
+    password: string; 
+    metadata?: Record<string, unknown>;
+  };
+
+  // Create user via Admin API
+  const createResponse = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+    body: JSON.stringify({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: metadata || {},
+    }),
+  });
+
+  const userData = await createResponse.json();
+  
+  if (!createResponse.ok) {
+    throw new Error(userData.message || userData.error || "Failed to create user");
+  }
+
+  // Auto sign-in to return session
+  const signInResponse = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ email, password }),
+  });
+
+  const session = await signInResponse.json();
+
+  return {
+    user: userData,
+    session: signInResponse.ok ? session : null,
+    access_token: session?.access_token,
+    refresh_token: session?.refresh_token,
+    message: "User created successfully",
+  };
+}
+
+async function handleAuthSignIn(args: Record<string, unknown>): Promise<unknown> {
+  const { email, password } = args as { email: string; password: string };
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ email, password }),
+  });
+
+  const data = await response.json();
+  
+  if (!response.ok) {
+    throw new Error(data.error_description || data.error || "Sign in failed");
+  }
+
+  return {
+    user: data.user,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_in: data.expires_in,
+    expires_at: data.expires_at,
+  };
+}
+
+async function handleAuthSignOut(args: Record<string, unknown>): Promise<unknown> {
+  const { access_token } = args as { access_token: string };
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${access_token}`,
+    },
+  });
+
+  if (!response.ok && response.status !== 204) {
+    const data = await response.json();
+    throw new Error(data.error || "Sign out failed");
+  }
+
+  return { message: "Signed out successfully" };
+}
+
+async function handleAuthGetUser(args: Record<string, unknown>): Promise<unknown> {
+  const { access_token } = args as { access_token: string };
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: "GET",
+    headers: {
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${access_token}`,
+    },
+  });
+
+  const data = await response.json();
+  
+  if (!response.ok) {
+    throw new Error(data.error || "Failed to get user");
+  }
+
+  return { user: data };
+}
+
+async function handleAuthRefreshToken(args: Record<string, unknown>): Promise<unknown> {
+  const { refresh_token } = args as { refresh_token: string };
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ refresh_token }),
+  });
+
+  const data = await response.json();
+  
+  if (!response.ok) {
+    throw new Error(data.error_description || data.error || "Token refresh failed");
+  }
+
+  return {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_in: data.expires_in,
+    expires_at: data.expires_at,
+  };
+}
+
+async function handleAuthResetPassword(args: Record<string, unknown>): Promise<unknown> {
+  const { email } = args as { email: string };
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/recover`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ 
+      email,
+      redirect_to: `${SITE_URL}/reset-password`,
+    }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(data.error || "Password reset failed");
+  }
+
+  return { message: "Password reset email sent" };
+}
+
+async function handleAuthUpdatePassword(args: Record<string, unknown>): Promise<unknown> {
+  const { access_token, new_password } = args as { 
+    access_token: string; 
+    new_password: string;
+  };
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${access_token}`,
+    },
+    body: JSON.stringify({ password: new_password }),
+  });
+
+  const data = await response.json();
+  
+  if (!response.ok) {
+    throw new Error(data.error || "Password update failed");
+  }
+
+  return { message: "Password updated successfully", user: data };
+}
+
+async function handleAuthSignUpWithTenant(args: Record<string, unknown>): Promise<unknown> {
+  const { email, password, tenant_name, tenant_slug, user_metadata } = args as {
+    email: string;
+    password: string;
+    tenant_name: string;
+    tenant_slug?: string;
+    user_metadata?: Record<string, unknown>;
+  };
+
+  // 1. Create user
+  const createResponse = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+    body: JSON.stringify({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: user_metadata || {},
+    }),
+  });
+
+  const userData = await createResponse.json();
+  
+  if (!createResponse.ok) {
+    throw new Error(userData.message || userData.error || "Failed to create user");
+  }
+
+  // 2. Sign in to get session
+  const signInResponse = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ email, password }),
+  });
+
+  const session = await signInResponse.json();
+  
+  if (!signInResponse.ok) {
+    throw new Error(session.error || "Failed to sign in after account creation");
+  }
+
+  // 3. Create tenant via REST API (using service role for admin access)
+  const slug = tenant_slug || tenant_name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  
+  const tenantResponse = await fetch(`${SUPABASE_URL}/rest/v1/tenants`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Prefer": "return=representation",
+    },
+    body: JSON.stringify({
+      name: tenant_name,
+      slug: slug,
+      plan: "free",
+    }),
+  });
+
+  const tenantData = await tenantResponse.json();
+  
+  if (!tenantResponse.ok) {
+    throw new Error(tenantData.message || "Failed to create tenant");
+  }
+
+  const tenant = Array.isArray(tenantData) ? tenantData[0] : tenantData;
+
+  // 4. Link user to tenant as owner
+  const linkResponse = await fetch(`${SUPABASE_URL}/rest/v1/user_tenants`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Prefer": "return=representation",
+    },
+    body: JSON.stringify({
+      user_id: userData.id,
+      tenant_id: tenant.id,
+      role: "owner",
+      is_default: true,
+    }),
+  });
+
+  if (!linkResponse.ok) {
+    const linkError = await linkResponse.json();
+    throw new Error(linkError.message || "Failed to link user to tenant");
+  }
+
+  return {
+    user: userData,
+    tenant: tenant,
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_in: session.expires_in,
+    message: "Account and tenant created successfully",
+  };
+}
+
+// =====================================================
 // API CALLER
 // =====================================================
 
@@ -398,6 +798,18 @@ const adminFunctions = [
   "manage_database",
   "manage_cron",
   "update_service_catalog"
+];
+
+// Auth functions handled locally (not via Edge Functions)
+const authFunctions = [
+  "auth_sign_up",
+  "auth_sign_in",
+  "auth_sign_out",
+  "auth_get_user",
+  "auth_refresh_token",
+  "auth_reset_password",
+  "auth_update_password",
+  "auth_sign_up_with_tenant",
 ];
 
 async function callEdgeFunction(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -466,7 +878,7 @@ async function getFunctionRegistry(args: Record<string, unknown>): Promise<unkno
 const server = new Server(
   {
     name: "supabase-saas-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: {
@@ -487,7 +899,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     let result: unknown;
 
-    if (name === "get_function_registry") {
+    // Route auth functions to local handlers
+    if (name === "auth_sign_up") {
+      result = await handleAuthSignUp(args as Record<string, unknown>);
+    } else if (name === "auth_sign_in") {
+      result = await handleAuthSignIn(args as Record<string, unknown>);
+    } else if (name === "auth_sign_out") {
+      result = await handleAuthSignOut(args as Record<string, unknown>);
+    } else if (name === "auth_get_user") {
+      result = await handleAuthGetUser(args as Record<string, unknown>);
+    } else if (name === "auth_refresh_token") {
+      result = await handleAuthRefreshToken(args as Record<string, unknown>);
+    } else if (name === "auth_reset_password") {
+      result = await handleAuthResetPassword(args as Record<string, unknown>);
+    } else if (name === "auth_update_password") {
+      result = await handleAuthUpdatePassword(args as Record<string, unknown>);
+    } else if (name === "auth_sign_up_with_tenant") {
+      result = await handleAuthSignUpWithTenant(args as Record<string, unknown>);
+    } else if (name === "get_function_registry") {
       result = await getFunctionRegistry(args as Record<string, unknown>);
     } else if (name === "list_issues" || name === "search_code") {
       // These would use GitHub API - placeholder for now
@@ -521,7 +950,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Supabase SaaS MCP Server running");
+  console.error("Supabase SaaS MCP Server running (v1.1.0 with Auth)");
 }
 
 main().catch(console.error);
