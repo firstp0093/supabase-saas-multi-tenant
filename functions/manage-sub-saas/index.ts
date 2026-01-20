@@ -1,6 +1,7 @@
 // =====================================================
 // MANAGE SUB-SAAS
-// List, update, delete sub-SaaS apps and manage users
+// Manage existing sub-SaaS applications
+// List, update, delete, manage users, view metrics
 // =====================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
@@ -25,7 +26,7 @@ serve(async (req) => {
   const adminKey = req.headers.get('X-Admin-Key')
   const isAdmin = adminKey === ADMIN_KEY
 
-  // Get user and tenant
+  // Get authenticated user
   let user: any = null
   let membership: any = null
 
@@ -45,33 +46,67 @@ serve(async (req) => {
     }
   }
 
-  if (!user && !isAdmin) {
+  if (!isAdmin && !membership) {
     return new Response(JSON.stringify({ error: 'Authentication required' }), {
       status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     })
   }
 
-  const { action, sub_saas_id, settings, user_email, user_role, tenant_id: overrideTenantId } = await req.json()
-  const tenantId = isAdmin && overrideTenantId ? overrideTenantId : membership?.tenant_id
+  const body = await req.json()
+  const { action, sub_saas_id } = body
+  const tenantId = isAdmin ? body.tenant_id : membership?.tenant_id
+
+  // Helper to verify sub-saas access
+  async function verifyAccess(subSaasId: string): Promise<any> {
+    const { data } = await supabase
+      .from('sub_saas_apps')
+      .select('*')
+      .eq('id', subSaasId)
+      .single()
+
+    if (!data) return null
+    if (isAdmin) return data
+    if (data.tenant_id === tenantId) return data
+    return null
+  }
 
   // ===== LIST SUB-SAAS APPS =====
   if (action === 'list') {
     try {
       let query = supabase
         .from('sub_saas_apps')
-        .select('*')
-        .eq('status', 'active')
+        .select(`
+          id, name, slug, description, template,
+          subdomain, custom_domain, status,
+          stripe_connect_enabled, stripe_onboarding_complete,
+          max_users, created_at
+        `)
+        .neq('status', 'deleted')
         .order('created_at', { ascending: false })
 
-      if (!isAdmin && tenantId) {
+      if (!isAdmin) {
         query = query.eq('tenant_id', tenantId)
+      } else if (body.tenant_id) {
+        query = query.eq('tenant_id', body.tenant_id)
       }
 
       const { data, error } = await query
 
       if (error) throw error
 
-      return new Response(JSON.stringify({ sub_saas_apps: data }), {
+      // Get user counts for each app
+      const appsWithCounts = await Promise.all(
+        (data || []).map(async (app) => {
+          const { count } = await supabase
+            .from('sub_saas_users')
+            .select('*', { count: 'exact', head: true })
+            .eq('sub_saas_id', app.id)
+
+          return { ...app, user_count: count || 0 }
+        })
+      )
+
+      return new Response(JSON.stringify({ apps: appsWithCounts }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     } catch (error) {
@@ -81,7 +116,7 @@ serve(async (req) => {
     }
   }
 
-  // ===== GET SINGLE SUB-SAAS =====
+  // ===== GET SUB-SAAS APP =====
   if (action === 'get') {
     if (!sub_saas_id) {
       return new Response(JSON.stringify({ error: 'sub_saas_id required' }), {
@@ -89,30 +124,42 @@ serve(async (req) => {
       })
     }
 
-    try {
-      const { data, error } = await supabase
-        .from('sub_saas_apps')
-        .select(`
-          *,
-          sub_saas_users(count),
-          sub_saas_tables(*)
-        `)
-        .eq('id', sub_saas_id)
-        .single()
-
-      if (error) throw error
-
-      return new Response(JSON.stringify({ sub_saas: data }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      })
-    } catch (error) {
-      return new Response(JSON.stringify({ error: error.message }), {
-        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    const app = await verifyAccess(sub_saas_id)
+    if (!app) {
+      return new Response(JSON.stringify({ error: 'Not found or access denied' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
+
+    // Get user count
+    const { count: userCount } = await supabase
+      .from('sub_saas_users')
+      .select('*', { count: 'exact', head: true })
+      .eq('sub_saas_id', sub_saas_id)
+
+    // Get Stripe Connect info if enabled
+    let stripeConnect = null
+    if (app.stripe_connect_enabled) {
+      const { data } = await supabase
+        .from('stripe_connect_accounts')
+        .select('*')
+        .eq('sub_saas_id', sub_saas_id)
+        .single()
+      stripeConnect = data
+    }
+
+    return new Response(JSON.stringify({
+      app: {
+        ...app,
+        user_count: userCount || 0,
+        stripe_connect: stripeConnect
+      }
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
   }
 
-  // ===== UPDATE SUB-SAAS =====
+  // ===== UPDATE SUB-SAAS APP =====
   if (action === 'update') {
     if (!sub_saas_id) {
       return new Response(JSON.stringify({ error: 'sub_saas_id required' }), {
@@ -120,35 +167,43 @@ serve(async (req) => {
       })
     }
 
-    try {
-      const updates: any = { updated_at: new Date().toISOString() }
-      if (settings?.name) updates.name = settings.name
-      if (settings?.description !== undefined) updates.description = settings.description
-      if (settings?.branding) updates.branding = settings.branding
-      if (settings?.features) updates.features = settings.features
-      if (settings?.custom_domain !== undefined) updates.custom_domain = settings.custom_domain
-      if (settings?.settings) updates.settings = settings.settings
-
-      const { data, error } = await supabase
-        .from('sub_saas_apps')
-        .update(updates)
-        .eq('id', sub_saas_id)
-        .select()
-        .single()
-
-      if (error) throw error
-
-      return new Response(JSON.stringify({ success: true, sub_saas: data }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    const app = await verifyAccess(sub_saas_id)
+    if (!app) {
+      return new Response(JSON.stringify({ error: 'Not found or access denied' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
-    } catch (error) {
+    }
+
+    const { name, description, settings, branding, status, custom_domain, max_users } = body
+
+    const updates: any = {}
+    if (name) updates.name = name
+    if (description !== undefined) updates.description = description
+    if (settings) updates.settings = { ...app.settings, ...settings }
+    if (branding) updates.branding = { ...app.branding, ...branding }
+    if (status && ['active', 'paused', 'suspended'].includes(status)) updates.status = status
+    if (custom_domain !== undefined) updates.custom_domain = custom_domain || null
+    if (max_users) updates.max_users = max_users
+
+    const { data, error } = await supabase
+      .from('sub_saas_apps')
+      .update(updates)
+      .eq('id', sub_saas_id)
+      .select()
+      .single()
+
+    if (error) {
       return new Response(JSON.stringify({ error: error.message }), {
         status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
+
+    return new Response(JSON.stringify({ success: true, app: data }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
   }
 
-  // ===== DELETE (SOFT) SUB-SAAS =====
+  // ===== DELETE SUB-SAAS APP =====
   if (action === 'delete') {
     if (!sub_saas_id) {
       return new Response(JSON.stringify({ error: 'sub_saas_id required' }), {
@@ -156,22 +211,28 @@ serve(async (req) => {
       })
     }
 
-    try {
-      const { error } = await supabase
-        .from('sub_saas_apps')
-        .update({ status: 'deleted', updated_at: new Date().toISOString() })
-        .eq('id', sub_saas_id)
-
-      if (error) throw error
-
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    const app = await verifyAccess(sub_saas_id)
+    if (!app) {
+      return new Response(JSON.stringify({ error: 'Not found or access denied' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
-    } catch (error) {
+    }
+
+    // Soft delete
+    const { error } = await supabase
+      .from('sub_saas_apps')
+      .update({ status: 'deleted' })
+      .eq('id', sub_saas_id)
+
+    if (error) {
       return new Response(JSON.stringify({ error: error.message }), {
         status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
+
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
   }
 
   // ===== LIST USERS =====
@@ -182,94 +243,137 @@ serve(async (req) => {
       })
     }
 
-    try {
-      const { data, error } = await supabase
-        .from('sub_saas_users')
-        .select('*')
-        .eq('sub_saas_id', sub_saas_id)
-        .order('created_at', { ascending: false })
-
-      if (error) throw error
-
-      return new Response(JSON.stringify({ users: data }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    const app = await verifyAccess(sub_saas_id)
+    if (!app) {
+      return new Response(JSON.stringify({ error: 'Not found or access denied' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
-    } catch (error) {
+    }
+
+    const { data, error } = await supabase
+      .from('sub_saas_users')
+      .select('id, email, name, role, subscription_status, subscription_plan, last_login_at, created_at')
+      .eq('sub_saas_id', sub_saas_id)
+      .order('created_at', { ascending: false })
+
+    if (error) {
       return new Response(JSON.stringify({ error: error.message }), {
         status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
+
+    return new Response(JSON.stringify({ users: data }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
   }
 
   // ===== ADD USER =====
   if (action === 'add_user') {
-    if (!sub_saas_id || !user_email) {
-      return new Response(JSON.stringify({ error: 'sub_saas_id and user_email required' }), {
+    if (!sub_saas_id) {
+      return new Response(JSON.stringify({ error: 'sub_saas_id required' }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
 
-    try {
-      const { data, error } = await supabase
-        .from('sub_saas_users')
-        .insert({
-          sub_saas_id,
-          email: user_email,
-          role: user_role || 'user'
-        })
-        .select()
-        .single()
+    const { user_email, user_name, user_role = 'user' } = body
 
-      if (error) {
-        if (error.code === '23505') {
-          return new Response(JSON.stringify({ error: 'User already exists in this app' }), {
-            status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-          })
-        }
-        throw error
-      }
-
-      // Update user count
-      await supabase.rpc('update_sub_saas_metrics', { app_id: sub_saas_id })
-
-      return new Response(JSON.stringify({ success: true, user: data }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    if (!user_email) {
+      return new Response(JSON.stringify({ error: 'user_email required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
-    } catch (error) {
+    }
+
+    const app = await verifyAccess(sub_saas_id)
+    if (!app) {
+      return new Response(JSON.stringify({ error: 'Not found or access denied' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
+    }
+
+    // Check user limit
+    const { count } = await supabase
+      .from('sub_saas_users')
+      .select('*', { count: 'exact', head: true })
+      .eq('sub_saas_id', sub_saas_id)
+
+    if ((count || 0) >= app.max_users) {
+      return new Response(JSON.stringify({ error: `User limit reached (${app.max_users})` }), {
+        status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
+    }
+
+    const { data, error } = await supabase
+      .from('sub_saas_users')
+      .insert({
+        sub_saas_id,
+        email: user_email,
+        name: user_name,
+        role: user_role
+      })
+      .select()
+      .single()
+
+    if (error) {
+      if (error.code === '23505') {
+        return new Response(JSON.stringify({ error: 'User already exists' }), {
+          status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
       return new Response(JSON.stringify({ error: error.message }), {
         status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
+
+    return new Response(JSON.stringify({ success: true, user: data }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
   }
 
   // ===== REMOVE USER =====
   if (action === 'remove_user') {
-    if (!sub_saas_id || !user_email) {
-      return new Response(JSON.stringify({ error: 'sub_saas_id and user_email required' }), {
+    if (!sub_saas_id) {
+      return new Response(JSON.stringify({ error: 'sub_saas_id required' }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
 
-    try {
-      const { error } = await supabase
-        .from('sub_saas_users')
-        .delete()
-        .eq('sub_saas_id', sub_saas_id)
-        .eq('email', user_email)
+    const { user_id, user_email } = body
 
-      if (error) throw error
-
-      // Update user count
-      await supabase.rpc('update_sub_saas_metrics', { app_id: sub_saas_id })
-
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    if (!user_id && !user_email) {
+      return new Response(JSON.stringify({ error: 'user_id or user_email required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
-    } catch (error) {
+    }
+
+    const app = await verifyAccess(sub_saas_id)
+    if (!app) {
+      return new Response(JSON.stringify({ error: 'Not found or access denied' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
+    }
+
+    let query = supabase
+      .from('sub_saas_users')
+      .delete()
+      .eq('sub_saas_id', sub_saas_id)
+
+    if (user_id) {
+      query = query.eq('id', user_id)
+    } else {
+      query = query.eq('email', user_email)
+    }
+
+    const { error } = await query
+
+    if (error) {
       return new Response(JSON.stringify({ error: error.message }), {
         status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
+
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
   }
 
   // ===== GET METRICS =====
@@ -280,46 +384,64 @@ serve(async (req) => {
       })
     }
 
-    try {
-      // Update metrics first
-      await supabase.rpc('update_sub_saas_metrics', { app_id: sub_saas_id })
-
-      const { data: app } = await supabase
-        .from('sub_saas_apps')
-        .select('user_count, monthly_revenue, created_at')
-        .eq('id', sub_saas_id)
-        .single()
-
-      const { data: recentUsers } = await supabase
-        .from('sub_saas_users')
-        .select('created_at')
-        .eq('sub_saas_id', sub_saas_id)
-        .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
-
-      const { data: recentPayments } = await supabase
-        .from('sub_saas_payments')
-        .select('amount, created_at')
-        .eq('sub_saas_id', sub_saas_id)
-        .eq('status', 'succeeded')
-        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())
-
-      return new Response(JSON.stringify({
-        metrics: {
-          total_users: app?.user_count || 0,
-          monthly_revenue: app?.monthly_revenue || 0,
-          new_users_7d: recentUsers?.length || 0,
-          payments_30d: recentPayments?.length || 0,
-          revenue_30d: recentPayments?.reduce((sum, p) => sum + Number(p.amount), 0) || 0,
-          created_at: app?.created_at
-        }
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      })
-    } catch (error) {
-      return new Response(JSON.stringify({ error: error.message }), {
-        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    const app = await verifyAccess(sub_saas_id)
+    if (!app) {
+      return new Response(JSON.stringify({ error: 'Not found or access denied' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
+
+    // User metrics
+    const { count: totalUsers } = await supabase
+      .from('sub_saas_users')
+      .select('*', { count: 'exact', head: true })
+      .eq('sub_saas_id', sub_saas_id)
+
+    const { count: activeSubscriptions } = await supabase
+      .from('sub_saas_users')
+      .select('*', { count: 'exact', head: true })
+      .eq('sub_saas_id', sub_saas_id)
+      .eq('subscription_status', 'active')
+
+    // Payment metrics (if Stripe Connect enabled)
+    let paymentMetrics = null
+    if (app.stripe_connect_enabled) {
+      const { data: payments } = await supabase
+        .from('sub_saas_payments')
+        .select('amount, status')
+        .eq('sub_saas_id', sub_saas_id)
+        .eq('status', 'succeeded')
+
+      const totalRevenue = (payments || []).reduce((sum, p) => sum + p.amount, 0)
+
+      paymentMetrics = {
+        total_revenue: totalRevenue / 100, // Convert cents to dollars
+        total_transactions: payments?.length || 0
+      }
+    }
+
+    // Recent signups (last 30 days)
+    const thirtyDaysAgo = new Date()
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+
+    const { count: recentSignups } = await supabase
+      .from('sub_saas_users')
+      .select('*', { count: 'exact', head: true })
+      .eq('sub_saas_id', sub_saas_id)
+      .gte('created_at', thirtyDaysAgo.toISOString())
+
+    return new Response(JSON.stringify({
+      metrics: {
+        total_users: totalUsers || 0,
+        max_users: app.max_users,
+        active_subscriptions: activeSubscriptions || 0,
+        recent_signups_30d: recentSignups || 0,
+        payments: paymentMetrics,
+        status: app.status
+      }
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
   }
 
   return new Response(JSON.stringify({
