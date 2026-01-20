@@ -13,10 +13,111 @@ const corsHeaders = {
 }
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
+const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const ADMIN_KEY = Deno.env.get('ADMIN_KEY')!
+const SITE_URL = Deno.env.get('SITE_URL') || 'http://localhost:3000'
 
 // Tool definitions
 const tools = [
+  // ===== AUTHENTICATION TOOLS =====
+  {
+    name: "auth_sign_up",
+    description: "Create a new user account",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "User email address" },
+        password: { type: "string", description: "User password (min 6 chars)" },
+        metadata: { type: "object", description: "Optional user metadata" }
+      },
+      required: ["email", "password"]
+    }
+  },
+  {
+    name: "auth_sign_in",
+    description: "Sign in and get session tokens",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "User email address" },
+        password: { type: "string", description: "User password" }
+      },
+      required: ["email", "password"]
+    }
+  },
+  {
+    name: "auth_sign_out",
+    description: "Sign out and invalidate session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        access_token: { type: "string", description: "Current access token" }
+      },
+      required: ["access_token"]
+    }
+  },
+  {
+    name: "auth_get_user",
+    description: "Get current user details from access token",
+    inputSchema: {
+      type: "object",
+      properties: {
+        access_token: { type: "string", description: "User's access token" }
+      },
+      required: ["access_token"]
+    }
+  },
+  {
+    name: "auth_refresh_token",
+    description: "Refresh an expired access token",
+    inputSchema: {
+      type: "object",
+      properties: {
+        refresh_token: { type: "string", description: "Refresh token from sign-in" }
+      },
+      required: ["refresh_token"]
+    }
+  },
+  {
+    name: "auth_reset_password",
+    description: "Send password reset email",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "Email address" }
+      },
+      required: ["email"]
+    }
+  },
+  {
+    name: "auth_update_password",
+    description: "Update user password",
+    inputSchema: {
+      type: "object",
+      properties: {
+        access_token: { type: "string", description: "User's access token" },
+        new_password: { type: "string", description: "New password (min 6 chars)" }
+      },
+      required: ["access_token", "new_password"]
+    }
+  },
+  {
+    name: "auth_sign_up_with_tenant",
+    description: "Create user account AND provision tenant in one call",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "User email address" },
+        password: { type: "string", description: "User password (min 6 chars)" },
+        tenant_name: { type: "string", description: "Organization/company name" },
+        tenant_slug: { type: "string", description: "URL-friendly slug (optional)" },
+        user_metadata: { type: "object", description: "Optional user metadata" }
+      },
+      required: ["email", "password", "tenant_name"]
+    }
+  },
+
   // ===== INFRASTRUCTURE TOOLS =====
   {
     name: "manage_database",
@@ -312,6 +413,18 @@ const toolEndpoints: Record<string, string> = {
   manage_stripe_connect: "manage-stripe-connect",
 }
 
+// Auth tools handled directly (not via Edge Functions)
+const authTools = [
+  "auth_sign_up",
+  "auth_sign_in", 
+  "auth_sign_out",
+  "auth_get_user",
+  "auth_refresh_token",
+  "auth_reset_password",
+  "auth_update_password",
+  "auth_sign_up_with_tenant"
+]
+
 // Admin-only tools
 const adminTools = [
   "manage_database", 
@@ -324,6 +437,323 @@ const adminTools = [
   "create_sub_saas",
   "manage_stripe_connect"
 ]
+
+// =====================================================
+// AUTH HANDLERS
+// =====================================================
+
+async function handleAuthSignUp(args: Record<string, unknown>) {
+  const { email, password, metadata } = args as { 
+    email: string
+    password: string
+    metadata?: Record<string, unknown>
+  }
+
+  const createResponse = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+    body: JSON.stringify({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: metadata || {},
+    }),
+  })
+
+  const userData = await createResponse.json()
+  
+  if (!createResponse.ok) {
+    throw new Error(userData.message || userData.error || "Failed to create user")
+  }
+
+  const signInResponse = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ email, password }),
+  })
+
+  const session = await signInResponse.json()
+
+  return {
+    user: userData,
+    session: signInResponse.ok ? session : null,
+    access_token: session?.access_token,
+    refresh_token: session?.refresh_token,
+    message: "User created successfully",
+  }
+}
+
+async function handleAuthSignIn(args: Record<string, unknown>) {
+  const { email, password } = args as { email: string; password: string }
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ email, password }),
+  })
+
+  const data = await response.json()
+  
+  if (!response.ok) {
+    throw new Error(data.error_description || data.error || "Sign in failed")
+  }
+
+  return {
+    user: data.user,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_in: data.expires_in,
+    expires_at: data.expires_at,
+  }
+}
+
+async function handleAuthSignOut(args: Record<string, unknown>) {
+  const { access_token } = args as { access_token: string }
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${access_token}`,
+    },
+  })
+
+  if (!response.ok && response.status !== 204) {
+    const data = await response.json()
+    throw new Error(data.error || "Sign out failed")
+  }
+
+  return { message: "Signed out successfully" }
+}
+
+async function handleAuthGetUser(args: Record<string, unknown>) {
+  const { access_token } = args as { access_token: string }
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: "GET",
+    headers: {
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${access_token}`,
+    },
+  })
+
+  const data = await response.json()
+  
+  if (!response.ok) {
+    throw new Error(data.error || "Failed to get user")
+  }
+
+  return { user: data }
+}
+
+async function handleAuthRefreshToken(args: Record<string, unknown>) {
+  const { refresh_token } = args as { refresh_token: string }
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ refresh_token }),
+  })
+
+  const data = await response.json()
+  
+  if (!response.ok) {
+    throw new Error(data.error_description || data.error || "Token refresh failed")
+  }
+
+  return {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_in: data.expires_in,
+    expires_at: data.expires_at,
+  }
+}
+
+async function handleAuthResetPassword(args: Record<string, unknown>) {
+  const { email } = args as { email: string }
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/recover`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ 
+      email,
+      redirect_to: `${SITE_URL}/reset-password`,
+    }),
+  })
+
+  if (!response.ok) {
+    const data = await response.json()
+    throw new Error(data.error || "Password reset failed")
+  }
+
+  return { message: "Password reset email sent" }
+}
+
+async function handleAuthUpdatePassword(args: Record<string, unknown>) {
+  const { access_token, new_password } = args as { 
+    access_token: string
+    new_password: string
+  }
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${access_token}`,
+    },
+    body: JSON.stringify({ password: new_password }),
+  })
+
+  const data = await response.json()
+  
+  if (!response.ok) {
+    throw new Error(data.error || "Password update failed")
+  }
+
+  return { message: "Password updated successfully", user: data }
+}
+
+async function handleAuthSignUpWithTenant(args: Record<string, unknown>) {
+  const { email, password, tenant_name, tenant_slug, user_metadata } = args as {
+    email: string
+    password: string
+    tenant_name: string
+    tenant_slug?: string
+    user_metadata?: Record<string, unknown>
+  }
+
+  // 1. Create user
+  const createResponse = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+    body: JSON.stringify({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: user_metadata || {},
+    }),
+  })
+
+  const userData = await createResponse.json()
+  
+  if (!createResponse.ok) {
+    throw new Error(userData.message || userData.error || "Failed to create user")
+  }
+
+  // 2. Sign in
+  const signInResponse = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ email, password }),
+  })
+
+  const session = await signInResponse.json()
+  
+  if (!signInResponse.ok) {
+    throw new Error(session.error || "Failed to sign in")
+  }
+
+  // 3. Create tenant
+  const slug = tenant_slug || tenant_name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
+  
+  const tenantResponse = await fetch(`${SUPABASE_URL}/rest/v1/tenants`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Prefer": "return=representation",
+    },
+    body: JSON.stringify({
+      name: tenant_name,
+      slug: slug,
+      plan: "free",
+    }),
+  })
+
+  const tenantData = await tenantResponse.json()
+  
+  if (!tenantResponse.ok) {
+    throw new Error(tenantData.message || "Failed to create tenant")
+  }
+
+  const tenant = Array.isArray(tenantData) ? tenantData[0] : tenantData
+
+  // 4. Link user to tenant
+  const linkResponse = await fetch(`${SUPABASE_URL}/rest/v1/user_tenants`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Prefer": "return=representation",
+    },
+    body: JSON.stringify({
+      user_id: userData.id,
+      tenant_id: tenant.id,
+      role: "owner",
+      is_default: true,
+    }),
+  })
+
+  if (!linkResponse.ok) {
+    const linkError = await linkResponse.json()
+    throw new Error(linkError.message || "Failed to link user to tenant")
+  }
+
+  return {
+    user: userData,
+    tenant: tenant,
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_in: session.expires_in,
+    message: "Account and tenant created successfully",
+  }
+}
+
+// Route auth tool calls
+async function handleAuthTool(name: string, args: Record<string, unknown>) {
+  switch (name) {
+    case "auth_sign_up": return handleAuthSignUp(args)
+    case "auth_sign_in": return handleAuthSignIn(args)
+    case "auth_sign_out": return handleAuthSignOut(args)
+    case "auth_get_user": return handleAuthGetUser(args)
+    case "auth_refresh_token": return handleAuthRefreshToken(args)
+    case "auth_reset_password": return handleAuthResetPassword(args)
+    case "auth_update_password": return handleAuthUpdatePassword(args)
+    case "auth_sign_up_with_tenant": return handleAuthSignUpWithTenant(args)
+    default: throw new Error(`Unknown auth tool: ${name}`)
+  }
+}
+
+// =====================================================
+// MAIN SERVER
+// =====================================================
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -342,8 +772,8 @@ serve(async (req) => {
   if (req.method === 'GET' && url.pathname.endsWith('/info')) {
     return new Response(JSON.stringify({
       name: "supabase-saas-mcp",
-      version: "2.0.0",
-      description: "MCP server for Supabase SaaS infrastructure - build and manage SaaS applications",
+      version: "2.1.0",
+      description: "MCP server for Supabase SaaS infrastructure with auth support",
       capabilities: {
         tools: true,
         resources: false,
@@ -367,10 +797,23 @@ serve(async (req) => {
     try {
       const { name, arguments: args } = await req.json()
 
+      // Check if it's an auth tool
+      if (authTools.includes(name)) {
+        const result = await handleAuthTool(name, args || {})
+        return new Response(JSON.stringify({
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2)
+          }]
+        }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
+
       if (!name || !toolEndpoints[name]) {
         return new Response(JSON.stringify({ 
           error: `Unknown tool: ${name}`,
-          available: Object.keys(toolEndpoints)
+          available: [...authTools, ...Object.keys(toolEndpoints)]
         }), {
           status: 400,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -439,11 +882,19 @@ serve(async (req) => {
       // If it's a simple {tool, ...args} format
       if (body.tool) {
         const { tool, ...args } = body
+
+        // Handle auth tools
+        if (authTools.includes(tool)) {
+          const result = await handleAuthTool(tool, args)
+          return new Response(JSON.stringify(result), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          })
+        }
         
         if (!toolEndpoints[tool]) {
           return new Response(JSON.stringify({ 
             error: `Unknown tool: ${tool}`,
-            available: Object.keys(toolEndpoints)
+            available: [...authTools, ...Object.keys(toolEndpoints)]
           }), {
             status: 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -480,15 +931,16 @@ serve(async (req) => {
       // Default: list tools
       return new Response(JSON.stringify({ 
         message: "MCP Server ready",
-        version: "2.0.0",
+        version: "2.1.0",
         endpoints: {
           "GET /info": "Server info",
           "GET /tools": "List tools",
           "POST /call": "Call tool (MCP format)",
           "POST /": "Call tool (simple format: {tool, ...args})"
         },
-        tools: Object.keys(toolEndpoints),
+        tools: [...authTools, ...Object.keys(toolEndpoints)],
         categories: {
+          authentication: authTools,
           infrastructure: ["manage_database", "manage_functions", "manage_secrets", "manage_cron", "manage_vault"],
           rbac_config: ["manage_rbac", "manage_config"],
           billing: ["manage_billing"],
@@ -512,8 +964,8 @@ serve(async (req) => {
   // GET / - Welcome
   return new Response(JSON.stringify({
     name: "supabase-saas-mcp",
-    version: "2.0.0",
-    description: "Build and manage SaaS applications via MCP",
+    version: "2.1.0",
+    description: "Build and manage SaaS applications via MCP (with auth support)",
     endpoints: {
       "GET /info": "Server info",
       "GET /tools": "List available tools", 
@@ -522,6 +974,7 @@ serve(async (req) => {
     },
     toolCount: tools.length,
     categories: {
+      authentication: authTools,
       infrastructure: ["manage_database", "manage_functions", "manage_secrets", "manage_cron", "manage_vault"],
       rbac_config: ["manage_rbac", "manage_config"],
       billing: ["manage_billing"],
