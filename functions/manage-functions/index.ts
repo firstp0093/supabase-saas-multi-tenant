@@ -15,7 +15,7 @@ const corsHeaders = {
 // Supabase Management API base URL
 const SUPABASE_PROJECT_REF = Deno.env.get('SUPABASE_URL')!.match(/https:\/\/([^.]+)/)?.[1]
 const MANAGEMENT_API = 'https://api.supabase.com/v1'
-const SUPABASE_ACCESS_TOKEN = Deno.env.get('SUPABASE_ACCESS_TOKEN')!  // Personal access token from supabase.com/dashboard/account/tokens
+const BASE_ACCESS_TOKEN = Deno.env.get('BASE_ACCESS_TOKEN')!  // Personal access token from supabase.com/dashboard/account/tokens
 const ADMIN_KEY = Deno.env.get('ADMIN_KEY')!
 
 serve(async (req) => {
@@ -37,7 +37,7 @@ serve(async (req) => {
   const { action, function_name, function_code, verify_jwt, import_map } = await req.json()
   
   const headers = {
-    'Authorization': `Bearer ${SUPABASE_ACCESS_TOKEN}`,
+    'Authorization': `Bearer ${BASE_ACCESS_TOKEN}`,
     'Content-Type': 'application/json'
   }
   
