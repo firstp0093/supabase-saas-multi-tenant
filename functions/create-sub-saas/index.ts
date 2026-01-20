@@ -1,6 +1,7 @@
 // =====================================================
 // CREATE SUB-SAAS
-// Creates a new sub-SaaS application for a tenant (B2B2C)
+// Creates a new sub-SaaS application for a tenant
+// Supports templates, Stripe Connect, custom domains
 // =====================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
@@ -11,8 +12,9 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-admin-key',
 }
 
-const STRIPE_SECRET_KEY = Deno.env.get('STRIPE_SECRET_KEY')!
 const ADMIN_KEY = Deno.env.get('ADMIN_KEY')!
+const STRIPE_SECRET_KEY = Deno.env.get('STRIPE_SECRET_KEY')!
+const PLATFORM_DOMAIN = Deno.env.get('PLATFORM_DOMAIN') || 'yourplatform.com'
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
@@ -26,7 +28,7 @@ serve(async (req) => {
   const adminKey = req.headers.get('X-Admin-Key')
   const isAdmin = adminKey === ADMIN_KEY
 
-  // Get user and tenant
+  // Get authenticated user
   let user: any = null
   let membership: any = null
 
@@ -36,9 +38,10 @@ serve(async (req) => {
     )
     if (authUser) {
       user = authUser
+      // Get user's tenant membership
       const { data: m } = await supabase
         .from('user_tenants')
-        .select('tenant_id, role')
+        .select('tenant_id, role, tenants(id, name, plan)')
         .eq('user_id', user.id)
         .eq('is_default', true)
         .single()
@@ -46,29 +49,26 @@ serve(async (req) => {
     }
   }
 
-  if (!user && !isAdmin) {
-    return new Response(JSON.stringify({ error: 'Authentication required' }), {
-      status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    })
-  }
-
-  // Only owners/admins can create sub-SaaS apps
-  if (!isAdmin && membership?.role !== 'owner' && membership?.role !== 'admin') {
-    return new Response(JSON.stringify({ error: 'Admin or owner role required' }), {
+  // Must be authenticated and have admin/owner role (or platform admin)
+  if (!isAdmin && (!membership || !['owner', 'admin'].includes(membership.role))) {
+    return new Response(JSON.stringify({ error: 'Admin access required' }), {
       status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     })
   }
 
+  const body = await req.json()
   const { 
     name, 
     slug, 
     description,
-    template = 'blank', 
+    template = 'blank',
     enable_stripe_connect = false,
     custom_domain,
-    tenant_id: overrideTenantId
-  } = await req.json()
+    settings = {},
+    branding = {}
+  } = body
 
+  // Validation
   if (!name || !slug) {
     return new Response(JSON.stringify({ error: 'name and slug are required' }), {
       status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -76,33 +76,67 @@ serve(async (req) => {
   }
 
   // Validate slug format
-  if (!/^[a-z0-9-]+$/.test(slug)) {
+  const slugRegex = /^[a-z0-9-]+$/
+  if (!slugRegex.test(slug)) {
     return new Response(JSON.stringify({ error: 'slug must be lowercase alphanumeric with hyphens only' }), {
       status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     })
   }
 
-  const tenantId = isAdmin && overrideTenantId ? overrideTenantId : membership?.tenant_id
+  const tenantId = isAdmin ? body.tenant_id : membership.tenant_id
 
   if (!tenantId) {
-    return new Response(JSON.stringify({ error: 'No tenant found' }), {
+    return new Response(JSON.stringify({ error: 'tenant_id required' }), {
       status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     })
   }
 
   try {
-    // Get template if specified
-    let templateData: any = null
-    if (template !== 'blank') {
-      const { data: tmpl } = await supabase
-        .from('sub_saas_templates')
-        .select('*')
-        .eq('name', template)
-        .single()
-      templateData = tmpl
+    // Check if slug is available
+    const { data: existing } = await supabase
+      .from('sub_saas_apps')
+      .select('id')
+      .or(`slug.eq.${slug},subdomain.eq.${slug}`)
+      .single()
+
+    if (existing) {
+      return new Response(JSON.stringify({ error: 'Slug already taken' }), {
+        status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
     }
 
-    // Create sub-SaaS app
+    // Check tenant's sub-saas limit based on plan
+    const { data: tenant } = await supabase
+      .from('tenants')
+      .select('plan')
+      .eq('id', tenantId)
+      .single()
+
+    const planLimits: Record<string, number> = {
+      free: 1,
+      starter: 3,
+      pro: 10,
+      enterprise: 100
+    }
+
+    const { count: currentCount } = await supabase
+      .from('sub_saas_apps')
+      .select('*', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId)
+      .neq('status', 'deleted')
+
+    const limit = planLimits[tenant?.plan || 'free']
+    if ((currentCount || 0) >= limit) {
+      return new Response(JSON.stringify({ 
+        error: `Plan limit reached. ${tenant?.plan || 'free'} plan allows ${limit} sub-apps. Upgrade to create more.`
+      }), {
+        status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
+    }
+
+    // Create the sub-saas app
+    const subdomain = `${slug}.${PLATFORM_DOMAIN}`
+    
     const { data: subSaas, error: createError } = await supabase
       .from('sub_saas_apps')
       .insert({
@@ -111,110 +145,44 @@ serve(async (req) => {
         slug,
         description,
         template,
-        settings: templateData?.settings || {},
-        branding: templateData?.branding || { primary_color: '#3B82F6', logo_url: null },
-        features: templateData?.settings?.features || [],
-        custom_domain,
-        stripe_connect_enabled: enable_stripe_connect
+        subdomain,
+        custom_domain: custom_domain || null,
+        branding,
+        settings,
+        stripe_connect_enabled: enable_stripe_connect,
+        status: 'active'
       })
       .select()
       .single()
 
     if (createError) {
-      if (createError.code === '23505') { // Unique violation
-        return new Response(JSON.stringify({ error: 'A sub-SaaS with this slug already exists' }), {
-          status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        })
-      }
       throw createError
     }
 
-    // Create tables from template
-    if (templateData?.tables) {
-      for (const tableDef of templateData.tables) {
-        await supabase
-          .from('sub_saas_tables')
-          .insert({
-            sub_saas_id: subSaas.id,
-            table_name: tableDef.name,
-            schema_definition: { columns: tableDef.columns }
-          })
-      }
+    // Apply template if not blank
+    if (template !== 'blank') {
+      await applyTemplate(supabase, subSaas.id, template)
     }
 
-    // Create Stripe Connect account if requested
-    let stripeConnectUrl = null
+    // Set up Stripe Connect if enabled
+    let stripeConnect = null
     if (enable_stripe_connect && STRIPE_SECRET_KEY) {
-      try {
-        // Create connected account
-        const accountResponse = await fetch('https://api.stripe.com/v1/accounts', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${STRIPE_SECRET_KEY}`,
-            'Content-Type': 'application/x-www-form-urlencoded'
-          },
-          body: new URLSearchParams({
-            'type': 'express',
-            'country': 'US',
-            'capabilities[card_payments][requested]': 'true',
-            'capabilities[transfers][requested]': 'true',
-            'metadata[sub_saas_id]': subSaas.id,
-            'metadata[tenant_id]': tenantId
-          })
-        })
-        const account = await accountResponse.json()
-
-        if (account.id) {
-          // Update sub-SaaS with account ID
-          await supabase
-            .from('sub_saas_apps')
-            .update({ stripe_connect_account_id: account.id })
-            .eq('id', subSaas.id)
-
-          // Generate onboarding link
-          const linkResponse = await fetch('https://api.stripe.com/v1/account_links', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${STRIPE_SECRET_KEY}`,
-              'Content-Type': 'application/x-www-form-urlencoded'
-            },
-            body: new URLSearchParams({
-              'account': account.id,
-              'refresh_url': `${Deno.env.get('SUPABASE_URL')}/sub-saas/${subSaas.slug}/stripe-refresh`,
-              'return_url': `${Deno.env.get('SUPABASE_URL')}/sub-saas/${subSaas.slug}/stripe-complete`,
-              'type': 'account_onboarding'
-            })
-          })
-          const link = await linkResponse.json()
-          stripeConnectUrl = link.url
-
-          subSaas.stripe_connect_account_id = account.id
-        }
-      } catch (stripeError) {
-        console.error('Stripe Connect error:', stripeError)
-        // Don't fail the whole operation, just note the error
-      }
-    }
-
-    // Add current user as owner of the sub-SaaS
-    if (user) {
-      await supabase
-        .from('sub_saas_users')
-        .insert({
-          sub_saas_id: subSaas.id,
-          auth_user_id: user.id,
-          email: user.email,
-          name: user.user_metadata?.full_name || user.email,
-          role: 'owner'
-        })
+      stripeConnect = await setupStripeConnect(supabase, subSaas.id, tenantId, name)
     }
 
     return new Response(JSON.stringify({
       success: true,
-      sub_saas: subSaas,
-      stripe_connect_onboarding_url: stripeConnectUrl,
-      template_applied: template,
-      tables_created: templateData?.tables?.length || 0
+      sub_saas: {
+        id: subSaas.id,
+        name: subSaas.name,
+        slug: subSaas.slug,
+        subdomain: subSaas.subdomain,
+        custom_domain: subSaas.custom_domain,
+        template: subSaas.template,
+        status: subSaas.status,
+        url: `https://${subSaas.subdomain}`
+      },
+      stripe_connect: stripeConnect
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     })
@@ -225,3 +193,232 @@ serve(async (req) => {
     })
   }
 })
+
+// =====================================================
+// TEMPLATE DEFINITIONS
+// =====================================================
+
+const templates: Record<string, { tables: any[], features: string[] }> = {
+  crm: {
+    tables: [
+      {
+        name: 'contacts',
+        display_name: 'Contacts',
+        schema: [
+          { name: 'name', type: 'text', required: true },
+          { name: 'email', type: 'text', required: true },
+          { name: 'phone', type: 'text' },
+          { name: 'company', type: 'text' },
+          { name: 'status', type: 'text', default: 'lead' },
+          { name: 'notes', type: 'text' }
+        ]
+      },
+      {
+        name: 'deals',
+        display_name: 'Deals',
+        schema: [
+          { name: 'title', type: 'text', required: true },
+          { name: 'value', type: 'numeric' },
+          { name: 'stage', type: 'text', default: 'discovery' },
+          { name: 'contact_id', type: 'uuid' },
+          { name: 'close_date', type: 'date' }
+        ]
+      }
+    ],
+    features: ['contacts', 'deals', 'pipeline', 'activities']
+  },
+  booking: {
+    tables: [
+      {
+        name: 'services',
+        display_name: 'Services',
+        schema: [
+          { name: 'name', type: 'text', required: true },
+          { name: 'description', type: 'text' },
+          { name: 'duration_minutes', type: 'integer', default: 60 },
+          { name: 'price', type: 'numeric' },
+          { name: 'active', type: 'boolean', default: true }
+        ]
+      },
+      {
+        name: 'bookings',
+        display_name: 'Bookings',
+        schema: [
+          { name: 'service_id', type: 'uuid', required: true },
+          { name: 'customer_name', type: 'text', required: true },
+          { name: 'customer_email', type: 'text', required: true },
+          { name: 'start_time', type: 'timestamptz', required: true },
+          { name: 'end_time', type: 'timestamptz', required: true },
+          { name: 'status', type: 'text', default: 'pending' },
+          { name: 'notes', type: 'text' }
+        ]
+      }
+    ],
+    features: ['services', 'bookings', 'calendar', 'reminders']
+  },
+  ecommerce: {
+    tables: [
+      {
+        name: 'products',
+        display_name: 'Products',
+        schema: [
+          { name: 'name', type: 'text', required: true },
+          { name: 'description', type: 'text' },
+          { name: 'price', type: 'numeric', required: true },
+          { name: 'sku', type: 'text' },
+          { name: 'inventory', type: 'integer', default: 0 },
+          { name: 'active', type: 'boolean', default: true },
+          { name: 'images', type: 'jsonb', default: '[]' }
+        ]
+      },
+      {
+        name: 'orders',
+        display_name: 'Orders',
+        schema: [
+          { name: 'customer_email', type: 'text', required: true },
+          { name: 'items', type: 'jsonb', required: true },
+          { name: 'total', type: 'numeric', required: true },
+          { name: 'status', type: 'text', default: 'pending' },
+          { name: 'shipping_address', type: 'jsonb' },
+          { name: 'payment_intent_id', type: 'text' }
+        ]
+      }
+    ],
+    features: ['products', 'orders', 'cart', 'payments', 'inventory']
+  },
+  helpdesk: {
+    tables: [
+      {
+        name: 'tickets',
+        display_name: 'Tickets',
+        schema: [
+          { name: 'subject', type: 'text', required: true },
+          { name: 'description', type: 'text', required: true },
+          { name: 'customer_email', type: 'text', required: true },
+          { name: 'priority', type: 'text', default: 'medium' },
+          { name: 'status', type: 'text', default: 'open' },
+          { name: 'assigned_to', type: 'uuid' }
+        ]
+      },
+      {
+        name: 'ticket_messages',
+        display_name: 'Messages',
+        schema: [
+          { name: 'ticket_id', type: 'uuid', required: true },
+          { name: 'message', type: 'text', required: true },
+          { name: 'sender_type', type: 'text', default: 'customer' },
+          { name: 'sender_id', type: 'text' }
+        ]
+      }
+    ],
+    features: ['tickets', 'messages', 'assignments', 'sla']
+  },
+  membership: {
+    tables: [
+      {
+        name: 'membership_plans',
+        display_name: 'Membership Plans',
+        schema: [
+          { name: 'name', type: 'text', required: true },
+          { name: 'description', type: 'text' },
+          { name: 'price_monthly', type: 'numeric' },
+          { name: 'price_yearly', type: 'numeric' },
+          { name: 'features', type: 'jsonb', default: '[]' },
+          { name: 'active', type: 'boolean', default: true }
+        ]
+      },
+      {
+        name: 'members',
+        display_name: 'Members',
+        schema: [
+          { name: 'email', type: 'text', required: true },
+          { name: 'name', type: 'text' },
+          { name: 'plan_id', type: 'uuid' },
+          { name: 'status', type: 'text', default: 'active' },
+          { name: 'joined_at', type: 'timestamptz' },
+          { name: 'expires_at', type: 'timestamptz' }
+        ]
+      }
+    ],
+    features: ['plans', 'members', 'billing', 'content_gating']
+  }
+}
+
+async function applyTemplate(supabase: any, subSaasId: string, templateName: string) {
+  const template = templates[templateName]
+  if (!template) return
+
+  // Record the tables in metadata
+  for (const table of template.tables) {
+    await supabase
+      .from('sub_saas_tables')
+      .insert({
+        sub_saas_id: subSaasId,
+        table_name: `ss_${subSaasId.replace(/-/g, '_')}_${table.name}`,
+        display_name: table.display_name,
+        schema_definition: table.schema,
+        is_system: true
+      })
+  }
+
+  // Update features
+  await supabase
+    .from('sub_saas_apps')
+    .update({ features_enabled: template.features })
+    .eq('id', subSaasId)
+}
+
+async function setupStripeConnect(supabase: any, subSaasId: string, tenantId: string, businessName: string) {
+  const stripeHeaders = {
+    'Authorization': `Bearer ${STRIPE_SECRET_KEY}`,
+    'Content-Type': 'application/x-www-form-urlencoded'
+  }
+
+  try {
+    // Create connected account (Express type for easier onboarding)
+    const accountResponse = await fetch('https://api.stripe.com/v1/accounts', {
+      method: 'POST',
+      headers: stripeHeaders,
+      body: new URLSearchParams({
+        'type': 'express',
+        'business_type': 'company',
+        'capabilities[card_payments][requested]': 'true',
+        'capabilities[transfers][requested]': 'true',
+        'metadata[sub_saas_id]': subSaasId,
+        'metadata[tenant_id]': tenantId
+      })
+    })
+    
+    const account = await accountResponse.json()
+
+    if (account.error) {
+      throw new Error(account.error.message)
+    }
+
+    // Save to database
+    await supabase
+      .from('stripe_connect_accounts')
+      .insert({
+        sub_saas_id: subSaasId,
+        tenant_id: tenantId,
+        stripe_account_id: account.id,
+        account_type: 'express',
+        business_name: businessName
+      })
+
+    // Update sub-saas app
+    await supabase
+      .from('sub_saas_apps')
+      .update({ stripe_account_id: account.id })
+      .eq('id', subSaasId)
+
+    return {
+      account_id: account.id,
+      onboarding_required: true
+    }
+
+  } catch (error) {
+    console.error('Stripe Connect setup failed:', error)
+    return null
+  }
+}
