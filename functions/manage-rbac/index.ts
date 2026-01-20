@@ -142,7 +142,7 @@ serve(async (req) => {
     }
 
     const { error } = await supabase
-      .from('tenant_users')
+      .from('user_tenants')
       .update({ role: role_name })
       .eq('user_id', user_id)
       .eq('tenant_id', tenant_id)
@@ -158,6 +158,32 @@ serve(async (req) => {
     })
   }
 
+  // ===== GET USER ROLE =====
+  if (action === 'get_user_role') {
+    if (!user_id || !tenant_id) {
+      return new Response(JSON.stringify({ error: 'user_id and tenant_id required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
+    }
+
+    const { data, error } = await supabase
+      .from('user_tenants')
+      .select('role')
+      .eq('user_id', user_id)
+      .eq('tenant_id', tenant_id)
+      .single()
+
+    if (error) {
+      return new Response(JSON.stringify({ error: error.message }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
+    }
+
+    return new Response(JSON.stringify({ role: data?.role }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
+  }
+
   // ===== CHECK PERMISSION =====
   if (action === 'check_permission') {
     if (!user_id || !tenant_id) {
@@ -167,7 +193,7 @@ serve(async (req) => {
     }
 
     const { data } = await supabase
-      .from('tenant_users')
+      .from('user_tenants')
       .select('role, roles(permissions)')
       .eq('user_id', user_id)
       .eq('tenant_id', tenant_id)
@@ -189,7 +215,7 @@ serve(async (req) => {
   }
 
   return new Response(JSON.stringify({
-    error: 'Invalid action. Use: list_roles, create_role, update_role, delete_role, assign_role, check_permission'
+    error: 'Invalid action. Use: list_roles, create_role, update_role, delete_role, assign_role, get_user_role, check_permission'
   }), {
     status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
   })
