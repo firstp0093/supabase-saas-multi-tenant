@@ -14,7 +14,7 @@ const corsHeaders = {
 
 const SUPABASE_PROJECT_REF = Deno.env.get('SUPABASE_URL')!.match(/https:\/\/([^.]+)/)?.[1]
 const MANAGEMENT_API = 'https://api.supabase.com/v1'
-const SUPABASE_ACCESS_TOKEN = Deno.env.get('SUPABASE_ACCESS_TOKEN')!
+const BASE_ACCESS_TOKEN = Deno.env.get('BASE_ACCESS_TOKEN')!  // Personal access token from supabase.com/dashboard/account/tokens
 const ADMIN_KEY = Deno.env.get('ADMIN_KEY')!
 
 serve(async (req) => {
@@ -36,7 +36,7 @@ serve(async (req) => {
   const { action, secrets } = await req.json()
   
   const headers = {
-    'Authorization': `Bearer ${SUPABASE_ACCESS_TOKEN}`,
+    'Authorization': `Bearer ${BASE_ACCESS_TOKEN}`,
     'Content-Type': 'application/json'
   }
   
@@ -96,7 +96,7 @@ serve(async (req) => {
     }
     
     // Prevent modifying critical secrets
-    const protectedSecrets = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ACCESS_TOKEN', 'ADMIN_KEY']
+    const protectedSecrets = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'BASE_ACCESS_TOKEN', 'ADMIN_KEY']
     const attemptedProtected = secrets.find((s: any) => protectedSecrets.includes(s.name))
     if (attemptedProtected) {
       return new Response(JSON.stringify({ 
@@ -154,7 +154,7 @@ serve(async (req) => {
     }
     
     // Prevent deleting critical secrets
-    const protectedSecrets = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ACCESS_TOKEN', 'ADMIN_KEY']
+    const protectedSecrets = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'BASE_ACCESS_TOKEN', 'ADMIN_KEY']
     const attemptedProtected = secrets.find((name: string) => protectedSecrets.includes(name))
     if (attemptedProtected) {
       return new Response(JSON.stringify({ 
