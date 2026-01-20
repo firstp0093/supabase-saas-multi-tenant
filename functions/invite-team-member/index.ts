@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import { sendTemplateEmail, sendQuickEmail } from '../_shared/email.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -23,9 +24,17 @@ serve(async (req) => {
     })
   }
   
+  // Get user's tenant with domain info
   const { data: userTenant } = await supabase
     .from('user_tenants')
-    .select('tenant_id, role, tenants(name, slug, plan)')
+    .select(`
+      tenant_id, 
+      role, 
+      tenants(
+        id, name, slug, plan,
+        domains(id, domain, email_enabled, is_primary)
+      )
+    `)
     .eq('user_id', user.id)
     .eq('is_default', true)
     .single()
@@ -36,7 +45,7 @@ serve(async (req) => {
     })
   }
   
-  const { email, role, message } = await req.json()
+  const { email, role, message, page_id, domain_id } = await req.json()
   
   if (!email || !email.includes('@')) {
     return new Response(JSON.stringify({ error: 'Invalid email' }), {
@@ -79,6 +88,7 @@ serve(async (req) => {
   
   // Create invite
   const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, '')
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
   
   const { data: invite, error: inviteError } = await supabase
     .from('invites')
@@ -88,7 +98,7 @@ serve(async (req) => {
       role: role || 'member',
       token,
       invited_by: user.id,
-      expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+      expires_at: expiresAt.toISOString()
     }, { onConflict: 'tenant_id,email' })
     .select()
     .single()
@@ -99,6 +109,85 @@ serve(async (req) => {
     })
   }
   
+  // Determine which domain to send from
+  let sendDomainId = domain_id
+  
+  // If page_id provided, get that page's domain
+  if (page_id && !sendDomainId) {
+    const { data: page } = await supabase
+      .from('pages')
+      .select('domain_id')
+      .eq('id', page_id)
+      .eq('tenant_id', userTenant.tenant_id)
+      .single()
+    
+    if (page?.domain_id) sendDomainId = page.domain_id
+  }
+  
+  // Fall back to tenant's primary domain
+  if (!sendDomainId && userTenant.tenants.domains?.length > 0) {
+    const primaryDomain = userTenant.tenants.domains.find((d: any) => d.is_primary && d.email_enabled)
+    if (primaryDomain) sendDomainId = primaryDomain.id
+  }
+  
+  const inviteUrl = `${Deno.env.get('APP_URL') || 'https://kurs.ing'}/invite/${token}`
+  
+  // Get inviter's name
+  const { data: inviterProfile } = await supabase
+    .from('profiles')
+    .select('full_name')
+    .eq('id', user.id)
+    .single()
+  
+  const inviterName = inviterProfile?.full_name || user.email?.split('@')[0] || 'A team member'
+  
+  // Send invite email
+  let emailResult = { success: false, error: 'Email not configured' }
+  
+  try {
+    // Try template first
+    emailResult = await sendTemplateEmail(supabase, {
+      templateName: 'team_invite',
+      to: email,
+      variables: {
+        tenant_name: userTenant.tenants.name,
+        inviter_name: inviterName,
+        role: role || 'member',
+        invite_url: inviteUrl,
+        expires_at: expiresAt.toLocaleDateString('en-US', { 
+          weekday: 'long', 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric' 
+        })
+      },
+      tenantId: userTenant.tenant_id,
+      domainId: sendDomainId
+    })
+  } catch (templateError) {
+    // Fall back to quick email if template fails
+    emailResult = await sendQuickEmail(supabase, {
+      to: email,
+      subject: `You've been invited to join ${userTenant.tenants.name}`,
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #333;">You're invited!</h2>
+          <p style="color: #666; font-size: 16px; line-height: 1.5;">
+            ${inviterName} has invited you to join <strong>${userTenant.tenants.name}</strong> as a ${role || 'member'}.
+          </p>
+          ${message ? `<p style="color: #666; font-size: 14px; background: #f5f5f5; padding: 12px; border-radius: 6px;">${message}</p>` : ''}
+          <a href="${inviteUrl}" style="display: inline-block; background: #0070f3; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; margin: 20px 0;">
+            Accept Invitation
+          </a>
+          <p style="color: #999; font-size: 14px;">This invitation expires in 7 days.</p>
+        </div>
+      `,
+      text: `You've been invited to join ${userTenant.tenants.name}!\n\n${inviterName} has invited you as a ${role || 'member'}.\n\nAccept: ${inviteUrl}`,
+      tenantId: userTenant.tenant_id,
+      domainId: sendDomainId
+    })
+  }
+  
   // Log activity
   await supabase.from('activity_log').insert({
     tenant_id: userTenant.tenant_id,
@@ -106,16 +195,22 @@ serve(async (req) => {
     action: 'team.invite_sent',
     resource_type: 'invite',
     resource_id: invite.id,
-    metadata: { email, role }
+    metadata: { 
+      email, 
+      role,
+      email_sent: emailResult.success,
+      email_id: emailResult.id,
+      domain_id: sendDomainId
+    }
   })
-  
-  const inviteUrl = `${Deno.env.get('APP_URL') || 'https://your-app.com'}/invite/${token}`
   
   return new Response(JSON.stringify({
     success: true,
     invite_id: invite.id,
     invite_url: inviteUrl,
-    expires_at: invite.expires_at
+    expires_at: invite.expires_at,
+    email_sent: emailResult.success,
+    email_error: emailResult.error
   }), {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' }
   })
